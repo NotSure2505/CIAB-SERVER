@@ -86,6 +86,8 @@ app.get('/auth/callback', async (req, res) => {
 
   try {
     // Exchange code for access token
+    // itch.io uses the access_token directly from the code, not a separate token endpoint
+    // The correct endpoint is /api/1/jwt/me with the code as the token
     const tokenRes = await fetch('https://itch.io/api/1/oauth2/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -99,7 +101,17 @@ app.get('/auth/callback', async (req, res) => {
       })
     });
 
-    const tokenData = await tokenRes.json();
+    // Log raw response for debugging
+    const rawTokenText = await tokenRes.text();
+    console.log('[Auth] Token exchange raw response:', rawTokenText);
+
+    let tokenData;
+    try {
+      tokenData = JSON.parse(rawTokenText);
+    } catch (e) {
+      throw new Error(`itch.io token endpoint returned HTML instead of JSON. Status: ${tokenRes.status}. This usually means the client_id, client_secret, or redirect_uri doesn't match.`);
+    }
+
     if (tokenData.error) throw new Error(tokenData.error_description || tokenData.error);
 
     const accessToken = tokenData.access_token;
@@ -108,7 +120,9 @@ app.get('/auth/callback', async (req, res) => {
     const profileRes = await fetch('https://itch.io/api/1/me', {
       headers: { Authorization: `Bearer ${accessToken}` }
     });
-    const profile = await profileRes.json();
+    const profileText = await profileRes.text();
+    console.log('[Auth] Profile raw response:', profileText);
+    const profile = JSON.parse(profileText);
     const itchUser = profile.user;
 
     console.log(`[Auth] Logged in: ${itchUser.username} (id: ${itchUser.id})`);
