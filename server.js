@@ -327,7 +327,7 @@ app.get('/player/crs', requireAuth, (req, res) => {
 
 // ─── Online Count (REST fallback) ────────────────────────────────────────────
 app.get('/lobby/online', (req, res) => {
-  res.json({ onlineCount: connectedPlayers.size });
+  res.json({ onlineCount: authenticatedCount() });
 });
 
 // ─── Invite Links ─────────────────────────────────────────────────────────────
@@ -410,12 +410,21 @@ const connectedPlayers = new Map(); // socketId → { itchId, displayName, inQue
 const matchQueue       = [];        // array of socketIds waiting for a match
 const activeRooms      = new Map(); // roomId → { players: [socketId, socketId], state }
 
+// Only count authenticated players
+function authenticatedCount() {
+  let count = 0;
+  for (const [, p] of connectedPlayers) {
+    if (p.itchId !== null) count++;
+  }
+  return count;
+}
+
 io.on('connection', (socket) => {
   console.log(`[Socket] Client connected: ${socket.id}`);
   connectedPlayers.set(socket.id, { itchId: null, displayName: null, inQueue: false, roomId: null });
 
   // Broadcast updated online count to everyone
-  io.emit('online_count', connectedPlayers.size);
+  io.emit('online_count', authenticatedCount());
 
   // ── Authenticate socket ──────────────────────────────────────────────────
   socket.on('authenticate', (token) => {
@@ -440,7 +449,7 @@ io.on('connection', (socket) => {
     player.inQueue = true;
     matchQueue.push(socket.id);
     socket.emit('queue_joined', { position: matchQueue.length });
-    io.emit('online_count', connectedPlayers.size);
+    io.emit('online_count', authenticatedCount());
 
     console.log(`[Queue] ${player.displayName} joined. Queue size: ${matchQueue.length}`);
 
@@ -515,7 +524,7 @@ io.on('connection', (socket) => {
       }
     }
     connectedPlayers.delete(socket.id);
-    io.emit('online_count', connectedPlayers.size);
+    io.emit('online_count', authenticatedCount());
     console.log(`[Socket] Disconnected: ${socket.id}`);
   });
 });
