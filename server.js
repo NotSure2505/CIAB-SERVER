@@ -85,44 +85,26 @@ app.get('/auth/callback', async (req, res) => {
   pendingAuth.delete(state);
 
   try {
-    // Exchange code for access token
-    // itch.io uses the access_token directly from the code, not a separate token endpoint
-    // The correct endpoint is /api/1/jwt/me with the code as the token
-    const tokenRes = await fetch('https://itch.io/api/1/oauth2/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        client_id:     process.env.ITCH_CLIENT_ID,
-        client_secret: process.env.ITCH_CLIENT_SECRET,
-        grant_type:    'authorization_code',
-        code,
-        redirect_uri:  process.env.REDIRECT_URI,
-        code_verifier: pending.codeVerifier
-      })
-    });
-
-    // Log raw response for debugging
-    const rawTokenText = await tokenRes.text();
-    console.log('[Auth] Token exchange raw response:', rawTokenText);
-
-    let tokenData;
-    try {
-      tokenData = JSON.parse(rawTokenText);
-    } catch (e) {
-      throw new Error(`itch.io token endpoint returned HTML instead of JSON. Status: ${tokenRes.status}. This usually means the client_id, client_secret, or redirect_uri doesn't match.`);
-    }
-
-    if (tokenData.error) throw new Error(tokenData.error_description || tokenData.error);
-
-    const accessToken = tokenData.access_token;
+    // itch.io sends the access token directly as the `code` parameter
+    // There is no token exchange step — the code IS the access token
+    const accessToken = code;
+    console.log('[Auth] Using code directly as access token');
 
     // Fetch user profile
     const profileRes = await fetch('https://itch.io/api/1/me', {
       headers: { Authorization: `Bearer ${accessToken}` }
     });
     const profileText = await profileRes.text();
-    console.log('[Auth] Profile raw response:', profileText);
-    const profile = JSON.parse(profileText);
+    console.log('[Auth] Profile raw response:', profileText.substring(0, 200));
+
+    let profile;
+    try {
+      profile = JSON.parse(profileText);
+    } catch (e) {
+      throw new Error('Could not parse profile response from itch.io');
+    }
+
+    if (profile.errors) throw new Error(profile.errors.join(', '));
     const itchUser = profile.user;
 
     console.log(`[Auth] Logged in: ${itchUser.username} (id: ${itchUser.id})`);
