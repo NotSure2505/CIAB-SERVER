@@ -119,7 +119,7 @@ app.get('/auth/callback', async (req, res) => {
     const userId = tokenData.key?.user_id;
     console.log(`[Auth] Got access token for user_id: ${userId}, fetching profile...`);
 
-    const profileRes = await fetch(`https://api.itch.io/api/1/${accessToken}/me`);
+    const profileRes = await fetch("https://api.itch.io/api/1/me", { headers: { Authorization: `Bearer ${accessToken}` } });
     const profileText = await profileRes.text();
     console.log('[Auth] Profile response:', profileText.substring(0, 300));
 
