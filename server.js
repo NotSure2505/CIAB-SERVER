@@ -85,17 +85,42 @@ app.get('/auth/callback', async (req, res) => {
   pendingAuth.delete(state);
 
   try {
-    // itch.io sends the access token directly as the `code` parameter
-    // There is no token exchange step — the code IS the access token
-    const accessToken = code;
-    console.log('[Auth] Using code directly as access token');
-
-    // Fetch user profile
-    const profileRes = await fetch('https://itch.io/api/1/me', {
-      headers: { Authorization: `Bearer ${accessToken}` }
+    // Exchange code for access token using correct itch.io endpoint
+    console.log('[Auth] Exchanging code for token...');
+    const tokenRes = await fetch('https://api.itch.io/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id:     process.env.ITCH_CLIENT_ID,
+        grant_type:    'authorization_code',
+        code,
+        code_verifier: pending.codeVerifier,
+        redirect_uri:  process.env.REDIRECT_URI
+      })
     });
+
+    const rawToken = await tokenRes.text();
+    console.log('[Auth] Token response:', rawToken.substring(0, 300));
+
+    let tokenData;
+    try {
+      tokenData = JSON.parse(rawToken);
+    } catch (e) {
+      throw new Error(`Token exchange failed: ${rawToken.substring(0, 100)}`);
+    }
+
+    if (tokenData.errors) throw new Error(tokenData.errors.join(', '));
+
+    // itch.io returns { key: { key: "abc123..." } }
+    const accessToken = tokenData.key?.key || tokenData.access_token;
+    if (!accessToken) throw new Error('No access token in response: ' + JSON.stringify(tokenData));
+
+    console.log('[Auth] Got access token, fetching profile...');
+
+    // Fetch user profile — itch.io uses KEY in the URL path
+    const profileRes = await fetch(`https://api.itch.io/api/1/${accessToken}/me`);
     const profileText = await profileRes.text();
-    console.log('[Auth] Profile raw response:', profileText.substring(0, 200));
+    console.log('[Auth] Profile response:', profileText.substring(0, 300));
 
     let profile;
     try {
