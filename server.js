@@ -21,16 +21,20 @@ app.use(express.json());
 app.use(cors({ origin: '*', credentials: true }));
 
 // ─── In-memory stores ─────────────────────────────────────────────────────────
-const users         = new Map();  // itchId → user object
-const pendingAuth   = new Map();  // state → { codeVerifier, createdAt }
-const sessionTokens = new Map();  // token → itchId
-const inviteCodes   = new Map();  // code → { itchId, roomId, createdAt }
+const users          = new Map();  // itchId → user object
+const pendingAuth    = new Map();  // state → { codeVerifier, createdAt }
+const completedAuth  = new Map();  // state → { token, createdAt }  ← NEW
+const sessionTokens  = new Map();  // token → itchId
+const inviteCodes    = new Map();  // code → { itchId, roomId, createdAt }
 
-// Clean up expired pending auths every 5 minutes
+// Clean up expired pending/completed auths every 5 minutes
 setInterval(() => {
   const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
   for (const [state, data] of pendingAuth) {
     if (data.createdAt < fiveMinutesAgo) pendingAuth.delete(state);
+  }
+  for (const [state, data] of completedAuth) {
+    if (data.createdAt < fiveMinutesAgo) completedAuth.delete(state);
   }
 }, 5 * 60 * 1000);
 
@@ -157,6 +161,10 @@ app.get('/auth/callback', async (req, res) => {
     const sessionToken = crypto.randomBytes(32).toString('hex');
     sessionTokens.set(sessionToken, itchUser.id);
 
+    // ── Store completed auth so /auth/poll can retrieve it by state ──────────
+    completedAuth.set(state, { token: sessionToken, createdAt: Date.now() });
+    console.log(`[Auth] Token stored for poll, state: ${state}`);
+
     const redirectUrl = process.env.USE_DEEP_LINK === 'true'
       ? `carrotbox://auth?token=${sessionToken}&username=${encodeURIComponent(itchUser.username)}`
       : `/auth/success?token=${sessionToken}&username=${encodeURIComponent(itchUser.display_name || itchUser.username)}`;
@@ -166,6 +174,21 @@ app.get('/auth/callback', async (req, res) => {
     console.error('[Auth] OAuth error:', err);
     res.redirect(`/auth/error?message=${encodeURIComponent(err.message)}`);
   }
+});
+
+// ─── Poll for completed auth (client polls with state param) ─────────────────
+app.get('/auth/poll', (req, res) => {
+  const { state } = req.query;
+  if (!state) return res.json({ ready: false });
+
+  const completed = completedAuth.get(state);
+  if (completed) {
+    completedAuth.delete(state); // one-time use
+    console.log(`[Auth] Poll succeeded for state: ${state}`);
+    return res.json({ ready: true, token: completed.token });
+  }
+
+  res.json({ ready: false });
 });
 
 // ─── Success Page ─────────────────────────────────────────────────────────────
@@ -225,6 +248,7 @@ app.post('/auth/validate', (req, res) => {
   if (!user) return res.status(401).json({ error: 'User not found' });
 
   res.json({
+    success:      true,
     valid:        true,
     itchId:       user.itchId,
     itchUsername: user.itchUsername,
@@ -499,7 +523,7 @@ function createMatch(socketIdA, socketIdB, roomId) {
   playerB.roomId  = roomId;
 
   // Randomly assign peeker role
-  const peekerIsA     = Math.random() < 0.5;
+  const peekerIsA       = Math.random() < 0.5;
   const peekerSocketId  = peekerIsA ? socketIdA : socketIdB;
   const guesserSocketId = peekerIsA ? socketIdB : socketIdA;
   const peekerPlayer    = peekerIsA ? playerA : playerB;
@@ -526,50 +550,62 @@ function createMatch(socketIdA, socketIdB, roomId) {
     message:      `Match found! Playing against ${playerA.displayName}`
   });
 
-  console.log(`[Match] Room ${roomId}: ${peekerPlayer.displayName} (peeker) vs ${guesserPlayer.displayName} (guesser)`);
-
-  // Start the game room (peek phase begins immediately)
   startGameRoom(roomId, peekerSocketId, guesserSocketId);
+  console.log(`[Match] Room ${roomId}: ${peekerPlayer.displayName} (peeker) vs ${guesserPlayer.displayName} (guesser)`);
 }
 
-// ─── CRS Helper ───────────────────────────────────────────────────────────────
+// ─── CRS Calculation ──────────────────────────────────────────────────────────
 function calcCRS(wins, gamesPlayed) {
   if (gamesPlayed === 0) return 0;
-  return Math.round((wins / (gamesPlayed + 10)) * 1000);
+  const winRate   = wins / gamesPlayed;
+  const volumeBonus = Math.log10(gamesPlayed + 1) * 10;
+  return Math.round(winRate * 100 + volumeBonus);
 }
 
 
-// ─── Socket.io Connection Handler ────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// SOCKET.IO EVENT HANDLERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
 io.on('connection', (socket) => {
-  console.log(`[Socket] Client connected: ${socket.id}`);
+  console.log(`[Socket] Connected: ${socket.id}`);
   connectedPlayers.set(socket.id, { itchId: null, displayName: null, inQueue: false, roomId: null });
-  io.emit('online_count', authenticatedCount());
 
-  // ── Authenticate ────────────────────────────────────────────────────────────
-  socket.on('authenticate', (token) => {
-    const itchId = sessionTokens.get(token);
+  // ── Auth ──────────────────────────────────────────────────────────────────────
+  socket.on('authenticate', (data) => {
+    const itchId = sessionTokens.get(data.token);
     if (!itchId) { socket.emit('auth_error', 'Invalid token'); return; }
-    const user = users.get(itchId);
-    if (!user)  { socket.emit('auth_error', 'User not found'); return; }
 
-    const player       = connectedPlayers.get(socket.id);
+    const user = users.get(itchId);
+    if (!user) { socket.emit('auth_error', 'User not found'); return; }
+
+    const player = connectedPlayers.get(socket.id);
     player.itchId      = itchId;
     player.displayName = user.displayName;
-    socket.emit('authenticated', { displayName: user.displayName });
+
+    socket.emit('authenticated', {
+      itchId:       user.itchId,
+      itchUsername: user.itchUsername,
+      displayName:  user.displayName,
+      wins:         user.wins,
+      gamesPlayed:  user.gamesPlayed,
+      crs:          calcCRS(user.wins, user.gamesPlayed)
+    });
+
     io.emit('online_count', authenticatedCount());
-    console.log(`[Socket] Authenticated: ${user.displayName}`);
+    console.log(`[Socket] Authenticated: ${user.displayName} (${socket.id})`);
   });
 
-  // ── Matchmaking Queue ────────────────────────────────────────────────────────
+  // ── Matchmaking ───────────────────────────────────────────────────────────────
   socket.on('join_queue', () => {
     const player = connectedPlayers.get(socket.id);
     if (!player?.itchId) { socket.emit('error', 'Not authenticated'); return; }
-    if (player.inQueue)  return;
+    if (player.inQueue)  { return; }
 
     player.inQueue = true;
     matchQueue.push(socket.id);
     socket.emit('queue_joined', { position: matchQueue.length });
-    io.emit('online_count', authenticatedCount());
+    io.emit('queue_size', matchQueue.length);
     console.log(`[Queue] ${player.displayName} joined. Queue size: ${matchQueue.length}`);
     tryMakeMatch();
   });
@@ -623,7 +659,7 @@ io.on('connection', (socket) => {
     if (room.isPeeker(socket.id)) return; // only guesser decides
 
     if (room.decisionTimeout) clearTimeout(room.decisionTimeout);
-    resolveDecision(room.roomId, !!data.swap);
+    resolveDecision(room.roomId, !data.swap);
   });
 
   // ── Game: Result Acknowledgement (CRS update) ────────────────────────────────
