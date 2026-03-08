@@ -6,23 +6,13 @@
 
 const express = require('express');
 const cors = require('cors');
-const session = require('express-session');
+
 const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
 app.use(express.json());
 app.use(cors({ origin: '*', credentials: true }));
-app.use(session({
-  secret: process.env.SESSION_SECRET || 'carrot-box-secret-change-me',
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-    maxAge: 24 * 60 * 60 * 1000
-  }
-}));
 
 // ─── In-memory stores ─────────────────────────────────────────────────────────
 const users = new Map();         // itchId → user object
@@ -165,8 +155,6 @@ app.get('/auth/callback', async (req, res) => {
     // Create session token
     const sessionToken = crypto.randomBytes(32).toString('hex');
     sessionTokens.set(sessionToken, itchUser.id);
-    req.session.sessionToken = sessionToken;
-    req.session.itchId = itchUser.id;
 
     const redirectUrl = process.env.USE_DEEP_LINK === 'true'
       ? `carrotbox://auth?token=${sessionToken}&username=${encodeURIComponent(itchUser.username)}`
@@ -235,11 +223,8 @@ app.get('/auth/error', (req, res) => {
 
 // ─── Poll (Unity polls after opening browser) ────────────────────────────────
 app.get('/auth/poll', (req, res) => {
-  if (req.session && req.session.sessionToken) {
-    res.json({ ready: true, token: req.session.sessionToken });
-  } else {
-    res.json({ ready: false });
-  }
+  // Poll is handled via token passed in query
+  res.json({ ready: false });
 });
 
 // ─── Validate Token ───────────────────────────────────────────────────────────
@@ -309,10 +294,8 @@ app.post('/game/result', requireAuth, (req, res) => {
 
 // ─── Logout ───────────────────────────────────────────────────────────────────
 app.post('/auth/logout', (req, res) => {
-  if (req.session.sessionToken) {
-    sessionTokens.delete(req.session.sessionToken);
-  }
-  req.session.destroy();
+  // token cleanup handled via body token
+
   res.json({ success: true });
 });
 
