@@ -261,20 +261,62 @@ app.post('/user/display-name', requireAuth, (req, res) => {
   res.json({ success: true, displayName: clean });
 });
 
+// ─── CRS (Carrot Rating System) ──────────────────────────────────────────────
+const CRS_K = 10; // Smoothing constant — penalises low game counts
+
+function calcCRS(wins, gamesPlayed) {
+  if (gamesPlayed === 0) return 0;
+  return Math.round((wins / (gamesPlayed + CRS_K)) * 1000);
+}
+
+function getCarrotRank(crs) {
+  if (crs >= 900) return { rank: 'Carrot Legend',  emoji: '👑',      tier: 6 };
+  if (crs >= 750) return { rank: 'Carrot Master',  emoji: '🥕🥕🥕',  tier: 5 };
+  if (crs >= 600) return { rank: 'Carrot Hoarder', emoji: '🥕🥕',    tier: 4 };
+  if (crs >= 450) return { rank: 'Carrot Finder',  emoji: '🥕',      tier: 3 };
+  if (crs >= 250) return { rank: 'Digger',         emoji: '🐇',      tier: 2 };
+  if (crs >= 100) return { rank: 'Sprout',         emoji: '🌿',      tier: 1 };
+  return           { rank: 'Seedling',             emoji: '🌱',      tier: 0 };
+}
+
 // ─── Leaderboard ──────────────────────────────────────────────────────────────
 app.get('/leaderboard', (req, res) => {
   const entries = [];
   for (const [, user] of users) {
     if (user.isBanned || user.gamesPlayed === 0) continue;
+    const crs      = calcCRS(user.wins, user.gamesPlayed);
+    const rankInfo = getCarrotRank(crs);
     entries.push({
       displayName: user.displayName,
       wins:        user.wins,
       gamesPlayed: user.gamesPlayed,
-      winRate:     Math.round((user.wins / user.gamesPlayed) * 1000) / 1000
+      losses:      user.gamesPlayed - user.wins,
+      winRate:     Math.round((user.wins / user.gamesPlayed) * 1000) / 1000,
+      crs,
+      rank:        rankInfo.rank,
+      rankEmoji:   rankInfo.emoji,
+      tier:        rankInfo.tier
     });
   }
-  entries.sort((a, b) => b.winRate - a.winRate);
+  entries.sort((a, b) => b.crs - a.crs);
   res.json({ leaderboard: entries.slice(0, 50) });
+});
+
+// ─── Player CRS (single player lookup) ───────────────────────────────────────
+app.get('/player/crs', requireAuth, (req, res) => {
+  const user     = users.get(req.itchId);
+  const crs      = calcCRS(user.wins, user.gamesPlayed);
+  const rankInfo = getCarrotRank(crs);
+  res.json({
+    displayName: user.displayName,
+    wins:        user.wins,
+    gamesPlayed: user.gamesPlayed,
+    losses:      user.gamesPlayed - user.wins,
+    crs,
+    rank:        rankInfo.rank,
+    rankEmoji:   rankInfo.emoji,
+    tier:        rankInfo.tier
+  });
 });
 
 // ─── Online Count ─────────────────────────────────────────────────────────────
