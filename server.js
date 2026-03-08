@@ -1,7 +1,7 @@
 /**
- * Carrot in a Box - itch.io OAuth Server
- * Node.js/Express backend handling OAuth 2.0 flow with itch.io (PKCE)
- * State + codeVerifier are stored in a server-side Map to avoid session issues
+ * Carrot in a Box - itch.io OAuth + Matchmaking + Game Server
+ * Node.js/Express backend handling OAuth 2.0 flow with itch.io (PKCE),
+ * real-time matchmaking via Socket.io, game room logic, and WebRTC VOIP signalling.
  */
 
 const express    = require('express');
@@ -21,9 +21,10 @@ app.use(express.json());
 app.use(cors({ origin: '*', credentials: true }));
 
 // ─── In-memory stores ─────────────────────────────────────────────────────────
-const users = new Map();         // itchId → user object
-const pendingAuth = new Map();   // state → { codeVerifier, createdAt }
-const sessionTokens = new Map(); // token → itchId
+const users         = new Map();  // itchId → user object
+const pendingAuth   = new Map();  // state → { codeVerifier, createdAt }
+const sessionTokens = new Map();  // token → itchId
+const inviteCodes   = new Map();  // code → { itchId, roomId, createdAt }
 
 // Clean up expired pending auths every 5 minutes
 setInterval(() => {
@@ -33,18 +34,26 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-// ─── STEP 1: Build Authorization URL ────────────────────────────────────────
+// Clean up expired invites every 10 minutes
+setInterval(() => {
+  const tenMinutesAgo = Date.now() - 10 * 60 * 1000;
+  for (const [code, invite] of inviteCodes) {
+    if (invite.createdAt < tenMinutesAgo) inviteCodes.delete(code);
+  }
+}, 10 * 60 * 1000);
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REST ROUTES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── STEP 1: Build Authorization URL ─────────────────────────────────────────
 app.get('/auth/login', (req, res) => {
   const state = crypto.randomBytes(16).toString('hex');
 
-  // Generate PKCE
-  const codeVerifier = crypto.randomBytes(32).toString('base64url');
-  const codeChallenge = crypto
-    .createHash('sha256')
-    .update(codeVerifier)
-    .digest('base64url');
+  const codeVerifier  = crypto.randomBytes(32).toString('base64url');
+  const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
 
-  // Store codeVerifier in server-side map keyed by state (avoids session cookie issues)
   pendingAuth.set(state, { codeVerifier, createdAt: Date.now() });
 
   const params = new URLSearchParams({
@@ -52,7 +61,7 @@ app.get('/auth/login', (req, res) => {
     redirect_uri:          process.env.REDIRECT_URI,
     response_type:         'code',
     scope:                 'profile',
-    state:                 state,
+    state,
     code_challenge:        codeChallenge,
     code_challenge_method: 'S256'
   });
@@ -62,7 +71,7 @@ app.get('/auth/login', (req, res) => {
   res.json({ authUrl, state });
 });
 
-// ─── STEP 2: Handle Callback from itch.io ───────────────────────────────────
+// ─── STEP 2: Handle Callback from itch.io ────────────────────────────────────
 app.get('/auth/callback', async (req, res) => {
   const { code, state, error } = req.query;
 
@@ -71,7 +80,6 @@ app.get('/auth/callback', async (req, res) => {
     return res.redirect(`/auth/error?message=${encodeURIComponent(error)}`);
   }
 
-  // Look up codeVerifier from server-side map (no session needed)
   const pending = pendingAuth.get(state);
   if (!pending) {
     console.error('[Auth] State not found:', state);
@@ -81,7 +89,6 @@ app.get('/auth/callback', async (req, res) => {
   pendingAuth.delete(state);
 
   try {
-    // Exchange code for access token using correct itch.io endpoint
     console.log('[Auth] Exchanging code for token...');
     const tokenRes = await fetch('https://api.itch.io/oauth/token', {
       method: 'POST',
@@ -99,46 +106,35 @@ app.get('/auth/callback', async (req, res) => {
     console.log('[Auth] Token response:', rawToken.substring(0, 300));
 
     let tokenData;
-    try {
-      tokenData = JSON.parse(rawToken);
-    } catch (e) {
-      throw new Error(`Token exchange failed: ${rawToken.substring(0, 100)}`);
-    }
+    try { tokenData = JSON.parse(rawToken); }
+    catch (e) { throw new Error(`Token exchange failed: ${rawToken.substring(0, 100)}`); }
 
     if (tokenData.errors) throw new Error(tokenData.errors.join(', '));
 
     const accessToken = tokenData.access_token;
     if (!accessToken) throw new Error('No access token in response: ' + JSON.stringify(tokenData));
 
-    // itch.io token response includes user_id directly in key object
-    // Use it to fetch profile via the correct endpoint
     const userId = tokenData.key?.user_id;
     console.log(`[Auth] Got access token for user_id: ${userId}, fetching profile...`);
 
-    const profileRes = await fetch("https://itch.io/api/1/key/me", { headers: { Authorization: `Bearer ${accessToken}` } });
+    const profileRes  = await fetch('https://itch.io/api/1/key/me', {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    });
     const profileText = await profileRes.text();
     console.log('[Auth] Profile response:', profileText.substring(0, 300));
 
     let profile;
-    try {
-      profile = JSON.parse(profileText);
-    } catch (e) {
-      throw new Error('Could not parse profile response');
-    }
+    try { profile = JSON.parse(profileText); }
+    catch (e) { throw new Error('Could not parse profile response'); }
 
-    // Build itchUser from whatever we have
-    // If profile endpoint fails, fall back to token data
     const itchUser = profile.user || {
       id:           userId,
       username:     `user_${userId}`,
       display_name: `Player_${userId}`
     };
 
-    console.log('[Auth] User:', JSON.stringify(itchUser));
-
     console.log(`[Auth] Logged in: ${itchUser.username} (id: ${itchUser.id})`);
 
-    // Upsert user
     let user = users.get(itchUser.id);
     if (!user) {
       user = {
@@ -153,12 +149,11 @@ app.get('/auth/callback', async (req, res) => {
         createdAt:    new Date().toISOString()
       };
     } else {
-      user.accessToken = accessToken;
+      user.accessToken  = accessToken;
       user.itchUsername = itchUser.username;
     }
     users.set(itchUser.id, user);
 
-    // Create session token
     const sessionToken = crypto.randomBytes(32).toString('hex');
     sessionTokens.set(sessionToken, itchUser.id);
 
@@ -177,18 +172,14 @@ app.get('/auth/callback', async (req, res) => {
 app.get('/auth/success', (req, res) => {
   const { token, username } = req.query;
   res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Carrot in a Box - Login Successful</title>
-      <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: sans-serif; display: flex; align-items: center; justify-content: center;
-               min-height: 100vh; background: #1a1a2e; color: #e94560; flex-direction: column; gap: 16px; }
-        h1 { font-size: 2rem; }
-        p { color: #ccc; font-size: 1.1rem; }
-      </style>
-    </head>
+    <!DOCTYPE html><html>
+    <head><title>Carrot in a Box - Login Successful</title>
+    <style>
+      * { margin:0; padding:0; box-sizing:border-box; }
+      body { font-family:sans-serif; display:flex; align-items:center; justify-content:center;
+             min-height:100vh; background:#1a1a2e; color:#e94560; flex-direction:column; gap:16px; }
+      h1 { font-size:2rem; } p { color:#ccc; font-size:1.1rem; }
+    </style></head>
     <body>
       <h1>🥕 Welcome, ${username}!</h1>
       <p>Login successful. You can close this window and return to Carrot in a Box.</p>
@@ -198,8 +189,7 @@ app.get('/auth/success', (req, res) => {
         }
         setTimeout(() => window.close(), 3000);
       </script>
-    </body>
-    </html>
+    </body></html>
   `);
 });
 
@@ -207,30 +197,20 @@ app.get('/auth/success', (req, res) => {
 app.get('/auth/error', (req, res) => {
   const message = req.query.message || 'Unknown error occurred';
   res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Login Error</title>
-      <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: sans-serif; display: flex; align-items: center; justify-content: center;
-               min-height: 100vh; background: #1a1a2e; color: #e94560; flex-direction: column; gap: 16px; }
-        p { color: #ccc; }
-      </style>
-    </head>
+    <!DOCTYPE html><html>
+    <head><title>Login Error</title>
+    <style>
+      * { margin:0; padding:0; box-sizing:border-box; }
+      body { font-family:sans-serif; display:flex; align-items:center; justify-content:center;
+             min-height:100vh; background:#1a1a2e; color:#e94560; flex-direction:column; gap:16px; }
+      p { color:#ccc; }
+    </style></head>
     <body>
       <h1>Login Failed</h1>
       <p>${message}</p>
       <p>Please close this window and try again.</p>
-    </body>
-    </html>
+    </body></html>
   `);
-});
-
-// ─── Poll (Unity polls after opening browser) ────────────────────────────────
-app.get('/auth/poll', (req, res) => {
-  // Poll is handled via token passed in query
-  res.json({ ready: false });
 });
 
 // ─── Validate Token ───────────────────────────────────────────────────────────
@@ -243,10 +223,9 @@ app.post('/auth/validate', (req, res) => {
 
   const user = users.get(itchId);
   if (!user) return res.status(401).json({ error: 'User not found' });
-  if (user.isBanned) return res.status(403).json({ error: 'Account banned' });
 
   res.json({
-    success:      true,
+    valid:        true,
     itchId:       user.itchId,
     itchUsername: user.itchUsername,
     displayName:  user.displayName,
@@ -255,136 +234,41 @@ app.post('/auth/validate', (req, res) => {
   });
 });
 
-// ─── Update Display Name ──────────────────────────────────────────────────────
-app.post('/user/display-name', requireAuth, (req, res) => {
-  const { displayName } = req.body;
-  if (!displayName || displayName.length < 2 || displayName.length > 24) {
-    return res.status(400).json({ error: 'Display name must be 2-24 characters' });
-  }
-  const clean = displayName.replace(/[<>"']/g, '').trim();
-  const user = users.get(req.itchId);
-  user.displayName = clean;
-  res.json({ success: true, displayName: clean });
-});
-
-// ─── CRS (Carrot Rating System) ──────────────────────────────────────────────
-const CRS_K = 10; // Smoothing constant — penalises low game counts
-
-function calcCRS(wins, gamesPlayed) {
-  if (gamesPlayed === 0) return 0;
-  return Math.round((wins / (gamesPlayed + CRS_K)) * 1000);
-}
-
-function getCarrotRank(crs) {
-  if (crs >= 900) return { rank: 'Carrot Legend',  emoji: '👑',      tier: 6 };
-  if (crs >= 750) return { rank: 'Carrot Master',  emoji: '🥕🥕🥕',  tier: 5 };
-  if (crs >= 600) return { rank: 'Carrot Hoarder', emoji: '🥕🥕',    tier: 4 };
-  if (crs >= 450) return { rank: 'Carrot Finder',  emoji: '🥕',      tier: 3 };
-  if (crs >= 250) return { rank: 'Digger',         emoji: '🐇',      tier: 2 };
-  if (crs >= 100) return { rank: 'Sprout',         emoji: '🌿',      tier: 1 };
-  return           { rank: 'Seedling',             emoji: '🌱',      tier: 0 };
-}
-
-// ─── Leaderboard ──────────────────────────────────────────────────────────────
-app.get('/leaderboard', (req, res) => {
-  const entries = [];
-  for (const [, user] of users) {
-    if (user.isBanned || user.gamesPlayed === 0) continue;
-    const crs      = calcCRS(user.wins, user.gamesPlayed);
-    const rankInfo = getCarrotRank(crs);
-    entries.push({
-      displayName: user.displayName,
-      wins:        user.wins,
-      gamesPlayed: user.gamesPlayed,
-      losses:      user.gamesPlayed - user.wins,
-      winRate:     Math.round((user.wins / user.gamesPlayed) * 1000) / 1000,
-      crs,
-      rank:        rankInfo.rank,
-      rankEmoji:   rankInfo.emoji,
-      tier:        rankInfo.tier
-    });
-  }
-  entries.sort((a, b) => b.crs - a.crs);
-  res.json({ leaderboard: entries.slice(0, 50) });
-});
-
-// ─── Player CRS (single player lookup) ───────────────────────────────────────
-app.get('/player/crs', requireAuth, (req, res) => {
-  const user     = users.get(req.itchId);
-  const crs      = calcCRS(user.wins, user.gamesPlayed);
-  const rankInfo = getCarrotRank(crs);
-  res.json({
-    displayName: user.displayName,
-    wins:        user.wins,
-    gamesPlayed: user.gamesPlayed,
-    losses:      user.gamesPlayed - user.wins,
-    crs,
-    rank:        rankInfo.rank,
-    rankEmoji:   rankInfo.emoji,
-    tier:        rankInfo.tier
-  });
-});
-
-// ─── Online Count (REST fallback) ────────────────────────────────────────────
-app.get('/lobby/online', (req, res) => {
-  res.json({ onlineCount: authenticatedCount() });
-});
-
-// ─── Invite Links ─────────────────────────────────────────────────────────────
-const inviteCodes = new Map(); // code → { itchId, roomId, createdAt }
-
+// ─── Create Invite Link ───────────────────────────────────────────────────────
 app.post('/invite/create', requireAuth, (req, res) => {
-  const code    = crypto.randomBytes(6).toString('hex'); // e.g. "a3f9c2"
-  const roomId  = `room_${crypto.randomBytes(8).toString('hex')}`;
-  inviteCodes.set(code, {
-    itchId:    req.itchId,
-    roomId,
-    createdAt: Date.now()
-  });
-  // Invite link goes to itch.io game page with code in hash
+  const code   = crypto.randomBytes(6).toString('hex'); // e.g. "a3f9c2"
+  const roomId = `room_${crypto.randomBytes(8).toString('hex')}`;
+  inviteCodes.set(code, { itchId: req.itchId, roomId, createdAt: Date.now() });
   const inviteUrl = `https://notsure2505.itch.io/carrot-in-a-box#invite=${code}`;
   res.json({ code, roomId, inviteUrl });
 });
 
+// ─── Validate Invite ──────────────────────────────────────────────────────────
 app.get('/invite/:code', (req, res) => {
   const invite = inviteCodes.get(req.params.code);
   if (!invite) return res.status(404).json({ error: 'Invite not found or expired' });
   const age = Date.now() - invite.createdAt;
-  if (age > 10 * 60 * 1000) { // 10 min expiry
+  if (age > 10 * 60 * 1000) {
     inviteCodes.delete(req.params.code);
     return res.status(410).json({ error: 'Invite expired' });
   }
   const host = users.get(invite.itchId);
-  res.json({
-    valid:       true,
-    roomId:      invite.roomId,
-    hostName:    host?.displayName || 'Unknown',
-    code:        req.params.code
-  });
+  res.json({ valid: true, roomId: invite.roomId, hostName: host?.displayName || 'Unknown', code: req.params.code });
 });
 
-// Clean up expired invites every 10 minutes
-setInterval(() => {
-  const tenMinutesAgo = Date.now() - 10 * 60 * 1000;
-  for (const [code, invite] of inviteCodes) {
-    if (invite.createdAt < tenMinutesAgo) inviteCodes.delete(code);
-  }
-}, 10 * 60 * 1000);
-
-// ─── Record Game Result ───────────────────────────────────────────────────────
-app.post('/game/result', requireAuth, (req, res) => {
-  const { won } = req.body;
-  const user = users.get(req.itchId);
-  user.gamesPlayed++;
-  if (won) user.wins++;
-  res.json({ success: true, wins: user.wins, gamesPlayed: user.gamesPlayed });
-});
-
-// ─── Logout ───────────────────────────────────────────────────────────────────
-app.post('/auth/logout', (req, res) => {
-  // token cleanup handled via body token
-
-  res.json({ success: true });
+// ─── Leaderboard ──────────────────────────────────────────────────────────────
+app.get('/leaderboard', (req, res) => {
+  const entries = Array.from(users.values())
+    .filter(u => u.gamesPlayed > 0)
+    .map(u => ({
+      displayName: u.displayName,
+      wins:        u.wins,
+      gamesPlayed: u.gamesPlayed,
+      crs:         calcCRS(u.wins, u.gamesPlayed)
+    }))
+    .sort((a, b) => b.crs - a.crs)
+    .slice(0, 50);
+  res.json({ leaderboard: entries });
 });
 
 // ─── Health Check ─────────────────────────────────────────────────────────────
@@ -392,10 +276,15 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// ─── Logout ───────────────────────────────────────────────────────────────────
+app.post('/auth/logout', (req, res) => {
+  res.json({ success: true });
+});
+
 // ─── Auth Middleware ──────────────────────────────────────────────────────────
 function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization;
-  const token = authHeader ? authHeader.replace('Bearer ', '') : req.body?.token;
+  const token      = authHeader ? authHeader.replace('Bearer ', '') : req.body?.token;
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
 
   const itchId = sessionTokens.get(token);
@@ -405,12 +294,16 @@ function requireAuth(req, res, next) {
   next();
 }
 
-// ─── Socket.io — Real-time Matchmaking ───────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SOCKET.IO — MATCHMAKING + GAME ROOMS + VOIP SIGNALLING
+// ═══════════════════════════════════════════════════════════════════════════════
+
 const connectedPlayers = new Map(); // socketId → { itchId, displayName, inQueue, roomId }
 const matchQueue       = [];        // array of socketIds waiting for a match
-const activeRooms      = new Map(); // roomId → { players: [socketId, socketId], state }
+const activeRooms      = new Map(); // roomId → { players: [socketId, socketId] }
+const gameRooms        = new Map(); // roomId → GameRoom instance
 
-// Only count authenticated players
 function authenticatedCount() {
   let count = 0;
   for (const [, p] of connectedPlayers) {
@@ -419,117 +312,163 @@ function authenticatedCount() {
   return count;
 }
 
-io.on('connection', (socket) => {
-  console.log(`[Socket] Client connected: ${socket.id}`);
-  connectedPlayers.set(socket.id, { itchId: null, displayName: null, inQueue: false, roomId: null });
+// ─── Game Room Class ──────────────────────────────────────────────────────────
+class GameRoom {
+  constructor(roomId, peekerSocketId, guesserSocketId) {
+    this.roomId          = roomId;
+    this.peekerSocketId  = peekerSocketId;
+    this.guesserSocketId = guesserSocketId;
+    this.hasCarrot       = Math.random() < 0.5; // true = peeker's box has the carrot
+    this.phase           = 'peek';
+    this.guesserSwapped  = false;
+    this.decisionTimeout = null;
+    this.createdAt       = Date.now();
+  }
 
-  // Broadcast updated online count to everyone
-  io.emit('online_count', authenticatedCount());
+  getOpponentSocketId(socketId) {
+    if (socketId === this.peekerSocketId)  return this.guesserSocketId;
+    if (socketId === this.guesserSocketId) return this.peekerSocketId;
+    return null;
+  }
 
-  // ── Authenticate socket ──────────────────────────────────────────────────
-  socket.on('authenticate', (token) => {
-    const itchId = sessionTokens.get(token);
-    if (!itchId) { socket.emit('auth_error', 'Invalid token'); return; }
-    const user = users.get(itchId);
-    if (!user)  { socket.emit('auth_error', 'User not found'); return; }
+  isPeeker(socketId) { return socketId === this.peekerSocketId; }
+}
 
-    const player = connectedPlayers.get(socket.id);
-    player.itchId      = itchId;
-    player.displayName = user.displayName;
-    socket.emit('authenticated', { displayName: user.displayName });
-    console.log(`[Socket] Authenticated: ${user.displayName}`);
+// ─── Game Room Lifecycle ──────────────────────────────────────────────────────
+
+function startGameRoom(roomId, peekerSocketId, guesserSocketId) {
+  const room = new GameRoom(roomId, peekerSocketId, guesserSocketId);
+  gameRooms.set(roomId, room);
+
+  const peekerSocket  = io.sockets.sockets.get(peekerSocketId);
+  const guesserSocket = io.sockets.sockets.get(guesserSocketId);
+
+  // Send each player their peek state
+  peekerSocket?.emit('game_event', {
+    eventType: 'game_peek_ready',
+    payload:   JSON.stringify({ hasCarrot: room.hasCarrot })
+  });
+  guesserSocket?.emit('game_event', {
+    eventType: 'game_peek_ready',
+    payload:   JSON.stringify({ hasCarrot: false })
   });
 
-  // ── Join matchmaking queue ───────────────────────────────────────────────
-  socket.on('join_queue', () => {
-    const player = connectedPlayers.get(socket.id);
-    if (!player?.itchId) { socket.emit('error', 'Not authenticated'); return; }
-    if (player.inQueue)  { return; } // already in queue
+  console.log(`[Game] Room ${roomId} started — peeker has carrot: ${room.hasCarrot}`);
 
-    player.inQueue = true;
-    matchQueue.push(socket.id);
-    socket.emit('queue_joined', { position: matchQueue.length });
-    io.emit('online_count', authenticatedCount());
+  // After peek window, start deliberation
+  setTimeout(() => startDeliberation(roomId), 4000);
+}
 
-    console.log(`[Queue] ${player.displayName} joined. Queue size: ${matchQueue.length}`);
+function startDeliberation(roomId) {
+  const room = gameRooms.get(roomId);
+  if (!room) return;
 
-    // Try to make a match
-    tryMakeMatch();
+  room.phase = 'deliberate';
+
+  io.to(roomId).emit('game_event', {
+    eventType: 'game_deliberate_start',
+    payload:   JSON.stringify({ durationSeconds: 30 })
   });
 
-  // ── Leave matchmaking queue ──────────────────────────────────────────────
-  socket.on('leave_queue', () => {
-    const idx = matchQueue.indexOf(socket.id);
-    if (idx > -1) matchQueue.splice(idx, 1);
-    const player = connectedPlayers.get(socket.id);
-    if (player) player.inQueue = false;
-    socket.emit('queue_left');
+  console.log(`[Game] Room ${roomId} — deliberation started (30s)`);
+
+  // After deliberation window, move to decision
+  setTimeout(() => startDecision(roomId), 30000);
+}
+
+function startDecision(roomId) {
+  const room = gameRooms.get(roomId);
+  if (!room || room.phase !== 'deliberate') return;
+
+  room.phase = 'decision';
+
+  io.to(roomId).emit('game_event', {
+    eventType: 'game_decision_start',
+    payload:   JSON.stringify({})
   });
 
-  // ── Join via invite code ─────────────────────────────────────────────────
-  socket.on('join_invite', (code) => {
-    const player = connectedPlayers.get(socket.id);
-    if (!player?.itchId) { socket.emit('error', 'Not authenticated'); return; }
+  console.log(`[Game] Room ${roomId} — decision phase`);
 
-    const invite = inviteCodes.get(code);
-    if (!invite)  { socket.emit('invite_error', 'Invite not found or expired'); return; }
-
-    const age = Date.now() - invite.createdAt;
-    if (age > 10 * 60 * 1000) {
-      inviteCodes.delete(code);
-      socket.emit('invite_error', 'Invite has expired');
-      return;
+  // Auto-resolve as KEEP if guesser doesn't respond in 15s
+  room.decisionTimeout = setTimeout(() => {
+    if (room.phase === 'decision') {
+      console.log(`[Game] Room ${roomId} — decision timed out, defaulting to KEEP`);
+      resolveDecision(roomId, false);
     }
+  }, 15000);
+}
 
-    // Find the host socket
-    let hostSocketId = null;
-    for (const [sid, p] of connectedPlayers) {
-      if (p.itchId === invite.itchId) { hostSocketId = sid; break; }
-    }
+function resolveDecision(roomId, swap) {
+  const room = gameRooms.get(roomId);
+  if (!room) return;
 
-    if (!hostSocketId) { socket.emit('invite_error', 'Host is no longer online'); return; }
+  room.phase          = 'reveal';
+  room.guesserSwapped = swap;
 
-    inviteCodes.delete(code); // one-use invite
-    createMatch(hostSocketId, socket.id, invite.roomId);
+  // Determine final carrot positions after potential swap
+  let peekerHasCarrot  = room.hasCarrot;
+  let guesserHasCarrot = !room.hasCarrot;
+  if (swap) { [peekerHasCarrot, guesserHasCarrot] = [guesserHasCarrot, peekerHasCarrot]; }
+
+  const peekerSocket  = io.sockets.sockets.get(room.peekerSocketId);
+  const guesserSocket = io.sockets.sockets.get(room.guesserSocketId);
+
+  // Send reveal to each player
+  peekerSocket?.emit('game_event', {
+    eventType: 'game_reveal',
+    payload:   JSON.stringify({ myCarrot: peekerHasCarrot, opponentCarrot: guesserHasCarrot, swapped: swap })
+  });
+  guesserSocket?.emit('game_event', {
+    eventType: 'game_reveal',
+    payload:   JSON.stringify({ myCarrot: guesserHasCarrot, opponentCarrot: peekerHasCarrot, swapped: swap })
   });
 
-  // ── Host waits in invite room ───────────────────────────────────────────────
-  socket.on('host_invite_room', (code) => {
-    const invite = inviteCodes.get(code);
-    if (!invite) { socket.emit('invite_error', 'Invite not found'); return; }
-    socket.join(invite.roomId); // host joins room and waits
-    console.log(`[Socket] Host waiting in room ${invite.roomId}`);
-  });
+  console.log(`[Game] Room ${roomId} — reveal. Peeker has carrot: ${peekerHasCarrot}. Swapped: ${swap}`);
 
-  // ── In-game events (relay between players) ──────────────────────────────
-  socket.on('game_action', (data) => {
-    const player = connectedPlayers.get(socket.id);
-    if (!player?.roomId) return;
-    // Relay to the other player in the room
-    socket.to(player.roomId).emit('opponent_action', data);
-  });
+  // Send result after reveal animation (~3.5s)
+  setTimeout(() => {
+    const peekerPlayer  = connectedPlayers.get(room.peekerSocketId);
+    const guesserPlayer = connectedPlayers.get(room.guesserSocketId);
 
-  // ── Disconnect ───────────────────────────────────────────────────────────
-  socket.on('disconnect', () => {
-    const player = connectedPlayers.get(socket.id);
-    if (player) {
-      // Remove from queue
-      const idx = matchQueue.indexOf(socket.id);
-      if (idx > -1) matchQueue.splice(idx, 1);
+    const peekerUser  = peekerPlayer  ? users.get(peekerPlayer.itchId)  : null;
+    const guesserUser = guesserPlayer ? users.get(guesserPlayer.itchId) : null;
 
-      // Notify opponent if in a room
-      if (player.roomId) {
-        socket.to(player.roomId).emit('opponent_disconnected');
-        activeRooms.delete(player.roomId);
-      }
-    }
-    connectedPlayers.delete(socket.id);
-    io.emit('online_count', authenticatedCount());
-    console.log(`[Socket] Disconnected: ${socket.id}`);
-  });
-});
+    peekerSocket?.emit('game_event', {
+      eventType: 'game_result',
+      payload:   JSON.stringify({
+        winner:         peekerHasCarrot ? 'peeker' : 'guesser',
+        myCarrot:       peekerHasCarrot,
+        opponentCarrot: guesserHasCarrot,
+        swapped:        swap,
+        newCRS:         peekerUser ? calcCRS(peekerUser.wins, peekerUser.gamesPlayed) : 0
+      })
+    });
+    guesserSocket?.emit('game_event', {
+      eventType: 'game_result',
+      payload:   JSON.stringify({
+        winner:         guesserHasCarrot ? 'guesser' : 'peeker',
+        myCarrot:       guesserHasCarrot,
+        opponentCarrot: peekerHasCarrot,
+        swapped:        swap,
+        newCRS:         guesserUser ? calcCRS(guesserUser.wins, guesserUser.gamesPlayed) : 0
+      })
+    });
 
-// ── Match creation helpers ────────────────────────────────────────────────────
+    gameRooms.delete(roomId);
+    activeRooms.delete(roomId);
+    console.log(`[Game] Room ${roomId} complete. Winner: ${peekerHasCarrot ? 'Peeker' : 'Guesser'}`);
+  }, 3500);
+}
+
+function findRoomForSocket(socketId) {
+  for (const [, room] of gameRooms) {
+    if (room.peekerSocketId === socketId || room.guesserSocketId === socketId) return room;
+  }
+  return null;
+}
+
+// ─── Match Creation ───────────────────────────────────────────────────────────
+
 function tryMakeMatch() {
   if (matchQueue.length < 2) return;
 
@@ -540,7 +479,6 @@ function tryMakeMatch() {
   const playerB = connectedPlayers.get(socketIdB);
 
   if (!playerA || !playerB) {
-    // One disconnected — put the other back
     if (playerA) matchQueue.unshift(socketIdA);
     if (playerB) matchQueue.unshift(socketIdB);
     return;
@@ -553,7 +491,6 @@ function tryMakeMatch() {
 function createMatch(socketIdA, socketIdB, roomId) {
   const playerA = connectedPlayers.get(socketIdA);
   const playerB = connectedPlayers.get(socketIdB);
-
   if (!playerA || !playerB) return;
 
   playerA.inQueue = false;
@@ -561,28 +498,27 @@ function createMatch(socketIdA, socketIdB, roomId) {
   playerA.roomId  = roomId;
   playerB.roomId  = roomId;
 
-  // Randomly decide who sees inside the box (the "peeker")
-  const peekerIsA = Math.random() < 0.5;
+  // Randomly assign peeker role
+  const peekerIsA     = Math.random() < 0.5;
+  const peekerSocketId  = peekerIsA ? socketIdA : socketIdB;
+  const guesserSocketId = peekerIsA ? socketIdB : socketIdA;
+  const peekerPlayer    = peekerIsA ? playerA : playerB;
+  const guesserPlayer   = peekerIsA ? playerB : playerA;
 
-  activeRooms.set(roomId, {
-    players: [socketIdA, socketIdB],
-    state:   'waiting'
-  });
+  activeRooms.set(roomId, { players: [socketIdA, socketIdB] });
 
-  // Join both to the Socket.io room
   const socketA = io.sockets.sockets.get(socketIdA);
   const socketB = io.sockets.sockets.get(socketIdB);
   socketA?.join(roomId);
   socketB?.join(roomId);
 
-  // Notify both players — tell each their role
+  // Notify both players of match + role
   socketA?.emit('match_found', {
     roomId,
     opponentName: playerB.displayName,
-    role:         peekerIsA ? 'peeker' : 'guesser',  // peeker sees inside box
+    role:         peekerIsA ? 'peeker' : 'guesser',
     message:      `Match found! Playing against ${playerB.displayName}`
   });
-
   socketB?.emit('match_found', {
     roomId,
     opponentName: playerA.displayName,
@@ -590,9 +526,174 @@ function createMatch(socketIdA, socketIdB, roomId) {
     message:      `Match found! Playing against ${playerA.displayName}`
   });
 
-  console.log(`[Match] Created room ${roomId}: ${playerA.displayName} vs ${playerB.displayName}`);
+  console.log(`[Match] Room ${roomId}: ${peekerPlayer.displayName} (peeker) vs ${guesserPlayer.displayName} (guesser)`);
+
+  // Start the game room (peek phase begins immediately)
+  startGameRoom(roomId, peekerSocketId, guesserSocketId);
 }
 
-// ── Start server ──────────────────────────────────────────────────────────────
+// ─── CRS Helper ───────────────────────────────────────────────────────────────
+function calcCRS(wins, gamesPlayed) {
+  if (gamesPlayed === 0) return 0;
+  return Math.round((wins / (gamesPlayed + 10)) * 1000);
+}
+
+
+// ─── Socket.io Connection Handler ────────────────────────────────────────────
+io.on('connection', (socket) => {
+  console.log(`[Socket] Client connected: ${socket.id}`);
+  connectedPlayers.set(socket.id, { itchId: null, displayName: null, inQueue: false, roomId: null });
+  io.emit('online_count', authenticatedCount());
+
+  // ── Authenticate ────────────────────────────────────────────────────────────
+  socket.on('authenticate', (token) => {
+    const itchId = sessionTokens.get(token);
+    if (!itchId) { socket.emit('auth_error', 'Invalid token'); return; }
+    const user = users.get(itchId);
+    if (!user)  { socket.emit('auth_error', 'User not found'); return; }
+
+    const player       = connectedPlayers.get(socket.id);
+    player.itchId      = itchId;
+    player.displayName = user.displayName;
+    socket.emit('authenticated', { displayName: user.displayName });
+    io.emit('online_count', authenticatedCount());
+    console.log(`[Socket] Authenticated: ${user.displayName}`);
+  });
+
+  // ── Matchmaking Queue ────────────────────────────────────────────────────────
+  socket.on('join_queue', () => {
+    const player = connectedPlayers.get(socket.id);
+    if (!player?.itchId) { socket.emit('error', 'Not authenticated'); return; }
+    if (player.inQueue)  return;
+
+    player.inQueue = true;
+    matchQueue.push(socket.id);
+    socket.emit('queue_joined', { position: matchQueue.length });
+    io.emit('online_count', authenticatedCount());
+    console.log(`[Queue] ${player.displayName} joined. Queue size: ${matchQueue.length}`);
+    tryMakeMatch();
+  });
+
+  socket.on('leave_queue', () => {
+    const idx = matchQueue.indexOf(socket.id);
+    if (idx > -1) matchQueue.splice(idx, 1);
+    const player = connectedPlayers.get(socket.id);
+    if (player) player.inQueue = false;
+    socket.emit('queue_left');
+  });
+
+  // ── Invite Codes ─────────────────────────────────────────────────────────────
+  socket.on('join_invite', (code) => {
+    const player = connectedPlayers.get(socket.id);
+    if (!player?.itchId) { socket.emit('error', 'Not authenticated'); return; }
+
+    const invite = inviteCodes.get(code);
+    if (!invite) { socket.emit('invite_error', 'Invite not found or expired'); return; }
+
+    if (Date.now() - invite.createdAt > 10 * 60 * 1000) {
+      inviteCodes.delete(code);
+      socket.emit('invite_error', 'Invite has expired');
+      return;
+    }
+
+    let hostSocketId = null;
+    for (const [sid, p] of connectedPlayers) {
+      if (p.itchId === invite.itchId) { hostSocketId = sid; break; }
+    }
+    if (!hostSocketId) { socket.emit('invite_error', 'Host is no longer online'); return; }
+
+    inviteCodes.delete(code);
+    createMatch(hostSocketId, socket.id, invite.roomId);
+  });
+
+  socket.on('host_invite_room', (code) => {
+    const invite = inviteCodes.get(code);
+    if (!invite) { socket.emit('invite_error', 'Invite not found'); return; }
+    socket.join(invite.roomId);
+    console.log(`[Socket] Host waiting in room ${invite.roomId}`);
+  });
+
+  // ── Game: Guesser Decision ───────────────────────────────────────────────────
+  socket.on('game_decision', (data) => {
+    const player = connectedPlayers.get(socket.id);
+    if (!player?.itchId) return;
+
+    const room = findRoomForSocket(socket.id);
+    if (!room || room.phase !== 'decision') return;
+    if (room.isPeeker(socket.id)) return; // only guesser decides
+
+    if (room.decisionTimeout) clearTimeout(room.decisionTimeout);
+    resolveDecision(room.roomId, !!data.swap);
+  });
+
+  // ── Game: Result Acknowledgement (CRS update) ────────────────────────────────
+  socket.on('game_result_ack', (data) => {
+    const player = connectedPlayers.get(socket.id);
+    if (!player?.itchId) return;
+    if (typeof data.won !== 'boolean') return;
+
+    const user = users.get(player.itchId);
+    if (!user) return;
+
+    user.gamesPlayed = (user.gamesPlayed || 0) + 1;
+    if (data.won) user.wins = (user.wins || 0) + 1;
+
+    const crs = calcCRS(user.wins, user.gamesPlayed);
+    socket.emit('crs_update', { wins: user.wins, gamesPlayed: user.gamesPlayed, crs });
+    console.log(`[Game] CRS update — ${user.displayName}: ${crs} (${user.wins}W / ${user.gamesPlayed}G)`);
+  });
+
+  // ── VOIP: WebRTC Signal Relay ────────────────────────────────────────────────
+  socket.on('voip_signal', (data) => {
+    const room = findRoomForSocket(socket.id);
+    if (!room) return;
+
+    const opponentSocketId = room.getOpponentSocketId(socket.id);
+    if (!opponentSocketId) return;
+
+    const opponentSocket = io.sockets.sockets.get(opponentSocketId);
+    opponentSocket?.emit('game_event', {
+      eventType: 'voip_signal',
+      payload:   JSON.stringify(data)
+    });
+  });
+
+  // ── Disconnect ────────────────────────────────────────────────────────────────
+  socket.on('disconnect', () => {
+    const player = connectedPlayers.get(socket.id);
+    if (player) {
+      // Remove from matchmaking queue
+      const idx = matchQueue.indexOf(socket.id);
+      if (idx > -1) matchQueue.splice(idx, 1);
+
+      // Notify opponent and clean up active game room
+      const room = findRoomForSocket(socket.id);
+      if (room) {
+        const opponentSocketId = room.getOpponentSocketId(socket.id);
+        if (opponentSocketId) {
+          const opponentSocket = io.sockets.sockets.get(opponentSocketId);
+          opponentSocket?.emit('opponent_disconnected', { reason: 'disconnect' });
+        }
+        if (room.decisionTimeout) clearTimeout(room.decisionTimeout);
+        gameRooms.delete(room.roomId);
+        activeRooms.delete(room.roomId);
+        console.log(`[Game] Room ${room.roomId} closed — player disconnected`);
+      }
+
+      // Also notify via old room system for backward compat
+      if (player.roomId && !findRoomForSocket(socket.id)) {
+        socket.to(player.roomId).emit('opponent_disconnected');
+        activeRooms.delete(player.roomId);
+      }
+    }
+
+    connectedPlayers.delete(socket.id);
+    io.emit('online_count', authenticatedCount());
+    console.log(`[Socket] Disconnected: ${socket.id}`);
+  });
+});
+
+
+// ─── Start Server ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🥕 Carrot server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`🥕 Carrot in a Box server running on port ${PORT}`));
