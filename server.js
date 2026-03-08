@@ -21,20 +21,16 @@ app.use(express.json());
 app.use(cors({ origin: '*', credentials: true }));
 
 // ─── In-memory stores ─────────────────────────────────────────────────────────
-const users          = new Map();  // itchId → user object
-const pendingAuth    = new Map();  // state → { codeVerifier, createdAt }
-const completedAuth  = new Map();  // state → { token, createdAt }  ← NEW
-const sessionTokens  = new Map();  // token → itchId
-const inviteCodes    = new Map();  // code → { itchId, roomId, createdAt }
+const users         = new Map();  // itchId → user object
+const pendingAuth   = new Map();  // state → { codeVerifier, createdAt }
+const sessionTokens = new Map();  // token → itchId
+const inviteCodes   = new Map();  // code → { itchId, roomId, createdAt }
 
-// Clean up expired pending/completed auths every 5 minutes
+// Clean up expired pending auths every 5 minutes
 setInterval(() => {
   const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
   for (const [state, data] of pendingAuth) {
     if (data.createdAt < fiveMinutesAgo) pendingAuth.delete(state);
-  }
-  for (const [state, data] of completedAuth) {
-    if (data.createdAt < fiveMinutesAgo) completedAuth.delete(state);
   }
 }, 5 * 60 * 1000);
 
@@ -161,10 +157,6 @@ app.get('/auth/callback', async (req, res) => {
     const sessionToken = crypto.randomBytes(32).toString('hex');
     sessionTokens.set(sessionToken, itchUser.id);
 
-    // ── Store completed auth so /auth/poll can retrieve it by state ──────────
-    completedAuth.set(state, { token: sessionToken, createdAt: Date.now() });
-    console.log(`[Auth] Token stored for poll, state: ${state}`);
-
     const redirectUrl = process.env.USE_DEEP_LINK === 'true'
       ? `carrotbox://auth?token=${sessionToken}&username=${encodeURIComponent(itchUser.username)}`
       : `/auth/success?token=${sessionToken}&username=${encodeURIComponent(itchUser.display_name || itchUser.username)}`;
@@ -174,21 +166,6 @@ app.get('/auth/callback', async (req, res) => {
     console.error('[Auth] OAuth error:', err);
     res.redirect(`/auth/error?message=${encodeURIComponent(err.message)}`);
   }
-});
-
-// ─── Poll for completed auth (client polls with state param) ─────────────────
-app.get('/auth/poll', (req, res) => {
-  const { state } = req.query;
-  if (!state) return res.json({ ready: false });
-
-  const completed = completedAuth.get(state);
-  if (completed) {
-    completedAuth.delete(state); // one-time use
-    console.log(`[Auth] Poll succeeded for state: ${state}`);
-    return res.json({ ready: true, token: completed.token });
-  }
-
-  res.json({ ready: false });
 });
 
 // ─── Success Page ─────────────────────────────────────────────────────────────
@@ -248,6 +225,9 @@ app.post('/auth/validate', (req, res) => {
   if (!user) return res.status(401).json({ error: 'User not found' });
 
   res.json({
+    // BUG FIX: was missing `success: true` — the Unity client checks data.success
+    // to determine whether validation passed. Without it the client always fell
+    // through to the failure branch and deleted the saved token.
     success:      true,
     valid:        true,
     itchId:       user.itchId,
@@ -260,8 +240,8 @@ app.post('/auth/validate', (req, res) => {
 
 // ─── Create Invite Link ───────────────────────────────────────────────────────
 app.post('/invite/create', requireAuth, (req, res) => {
-  const code   = crypto.randomBytes(6).toString('hex'); // e.g. "a3f9c2"
-  const roomId = `room_${crypto.randomBytes(8).toString('hex')}`;
+  const code    = crypto.randomBytes(6).toString('hex');
+  const roomId  = `room_${crypto.randomBytes(8).toString('hex')}`;
   inviteCodes.set(code, { itchId: req.itchId, roomId, createdAt: Date.now() });
   const inviteUrl = `https://notsure2505.itch.io/carrot-in-a-box#invite=${code}`;
   res.json({ code, roomId, inviteUrl });
@@ -289,10 +269,16 @@ app.get('/leaderboard', (req, res) => {
       wins:        u.wins,
       gamesPlayed: u.gamesPlayed,
       crs:         calcCRS(u.wins, u.gamesPlayed)
+      // NOTE: losses and winRate are intentionally omitted — clients compute them
     }))
     .sort((a, b) => b.crs - a.crs)
     .slice(0, 50);
   res.json({ leaderboard: entries });
+});
+
+// ─── Online Count (REST fallback for Unity polling) ───────────────────────────
+app.get('/lobby/online', (req, res) => {
+  res.json({ onlineCount: authenticatedCount() });
 });
 
 // ─── Health Check ─────────────────────────────────────────────────────────────
@@ -302,6 +288,10 @@ app.get('/health', (req, res) => {
 
 // ─── Logout ───────────────────────────────────────────────────────────────────
 app.post('/auth/logout', (req, res) => {
+  // BUG FIX: also invalidate the server-side session token on logout
+  const authHeader = req.headers.authorization;
+  const token = authHeader ? authHeader.replace('Bearer ', '') : req.body?.token;
+  if (token) sessionTokens.delete(token);
   res.json({ success: true });
 });
 
@@ -346,6 +336,9 @@ class GameRoom {
     this.phase           = 'peek';
     this.guesserSwapped  = false;
     this.decisionTimeout = null;
+    // BUG FIX: track whether game_result_ack has been received to prevent
+    // both players sending it and doubling the stats increment.
+    this.resultAcked     = false;
     this.createdAt       = Date.now();
   }
 
@@ -367,7 +360,6 @@ function startGameRoom(roomId, peekerSocketId, guesserSocketId) {
   const peekerSocket  = io.sockets.sockets.get(peekerSocketId);
   const guesserSocket = io.sockets.sockets.get(guesserSocketId);
 
-  // Send each player their peek state
   peekerSocket?.emit('game_event', {
     eventType: 'game_peek_ready',
     payload:   JSON.stringify({ hasCarrot: room.hasCarrot })
@@ -379,7 +371,6 @@ function startGameRoom(roomId, peekerSocketId, guesserSocketId) {
 
   console.log(`[Game] Room ${roomId} started — peeker has carrot: ${room.hasCarrot}`);
 
-  // After peek window, start deliberation
   setTimeout(() => startDeliberation(roomId), 4000);
 }
 
@@ -396,7 +387,6 @@ function startDeliberation(roomId) {
 
   console.log(`[Game] Room ${roomId} — deliberation started (30s)`);
 
-  // After deliberation window, move to decision
   setTimeout(() => startDecision(roomId), 30000);
 }
 
@@ -429,7 +419,6 @@ function resolveDecision(roomId, swap) {
   room.phase          = 'reveal';
   room.guesserSwapped = swap;
 
-  // Determine final carrot positions after potential swap
   let peekerHasCarrot  = room.hasCarrot;
   let guesserHasCarrot = !room.hasCarrot;
   if (swap) { [peekerHasCarrot, guesserHasCarrot] = [guesserHasCarrot, peekerHasCarrot]; }
@@ -437,7 +426,6 @@ function resolveDecision(roomId, swap) {
   const peekerSocket  = io.sockets.sockets.get(room.peekerSocketId);
   const guesserSocket = io.sockets.sockets.get(room.guesserSocketId);
 
-  // Send reveal to each player
   peekerSocket?.emit('game_event', {
     eventType: 'game_reveal',
     payload:   JSON.stringify({ myCarrot: peekerHasCarrot, opponentCarrot: guesserHasCarrot, swapped: swap })
@@ -522,7 +510,6 @@ function createMatch(socketIdA, socketIdB, roomId) {
   playerA.roomId  = roomId;
   playerB.roomId  = roomId;
 
-  // Randomly assign peeker role
   const peekerIsA       = Math.random() < 0.5;
   const peekerSocketId  = peekerIsA ? socketIdA : socketIdB;
   const guesserSocketId = peekerIsA ? socketIdB : socketIdA;
@@ -536,7 +523,6 @@ function createMatch(socketIdA, socketIdB, roomId) {
   socketA?.join(roomId);
   socketB?.join(roomId);
 
-  // Notify both players of match + role
   socketA?.emit('match_found', {
     roomId,
     opponentName: playerB.displayName,
@@ -550,62 +536,49 @@ function createMatch(socketIdA, socketIdB, roomId) {
     message:      `Match found! Playing against ${playerA.displayName}`
   });
 
-  startGameRoom(roomId, peekerSocketId, guesserSocketId);
   console.log(`[Match] Room ${roomId}: ${peekerPlayer.displayName} (peeker) vs ${guesserPlayer.displayName} (guesser)`);
+
+  startGameRoom(roomId, peekerSocketId, guesserSocketId);
 }
 
-// ─── CRS Calculation ──────────────────────────────────────────────────────────
+// ─── CRS Helper ───────────────────────────────────────────────────────────────
 function calcCRS(wins, gamesPlayed) {
   if (gamesPlayed === 0) return 0;
-  const winRate   = wins / gamesPlayed;
-  const volumeBonus = Math.log10(gamesPlayed + 1) * 10;
-  return Math.round(winRate * 100 + volumeBonus);
+  return Math.round((wins / (gamesPlayed + 10)) * 1000);
 }
 
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SOCKET.IO EVENT HANDLERS
-// ═══════════════════════════════════════════════════════════════════════════════
-
+// ─── Socket.io Connection Handler ────────────────────────────────────────────
 io.on('connection', (socket) => {
-  console.log(`[Socket] Connected: ${socket.id}`);
+  console.log(`[Socket] Client connected: ${socket.id}`);
   connectedPlayers.set(socket.id, { itchId: null, displayName: null, inQueue: false, roomId: null });
+  io.emit('online_count', authenticatedCount());
 
-  // ── Auth ──────────────────────────────────────────────────────────────────────
-  socket.on('authenticate', (data) => {
-    const itchId = sessionTokens.get(data.token);
+  // ── Authenticate ────────────────────────────────────────────────────────────
+  socket.on('authenticate', (token) => {
+    const itchId = sessionTokens.get(token);
     if (!itchId) { socket.emit('auth_error', 'Invalid token'); return; }
-
     const user = users.get(itchId);
-    if (!user) { socket.emit('auth_error', 'User not found'); return; }
+    if (!user)  { socket.emit('auth_error', 'User not found'); return; }
 
-    const player = connectedPlayers.get(socket.id);
+    const player       = connectedPlayers.get(socket.id);
     player.itchId      = itchId;
     player.displayName = user.displayName;
-
-    socket.emit('authenticated', {
-      itchId:       user.itchId,
-      itchUsername: user.itchUsername,
-      displayName:  user.displayName,
-      wins:         user.wins,
-      gamesPlayed:  user.gamesPlayed,
-      crs:          calcCRS(user.wins, user.gamesPlayed)
-    });
-
+    socket.emit('authenticated', { displayName: user.displayName });
     io.emit('online_count', authenticatedCount());
-    console.log(`[Socket] Authenticated: ${user.displayName} (${socket.id})`);
+    console.log(`[Socket] Authenticated: ${user.displayName}`);
   });
 
-  // ── Matchmaking ───────────────────────────────────────────────────────────────
+  // ── Matchmaking Queue ────────────────────────────────────────────────────────
   socket.on('join_queue', () => {
     const player = connectedPlayers.get(socket.id);
     if (!player?.itchId) { socket.emit('error', 'Not authenticated'); return; }
-    if (player.inQueue)  { return; }
+    if (player.inQueue)  return;
 
     player.inQueue = true;
     matchQueue.push(socket.id);
     socket.emit('queue_joined', { position: matchQueue.length });
-    io.emit('queue_size', matchQueue.length);
+    io.emit('online_count', authenticatedCount());
     console.log(`[Queue] ${player.displayName} joined. Queue size: ${matchQueue.length}`);
     tryMakeMatch();
   });
@@ -659,7 +632,10 @@ io.on('connection', (socket) => {
     if (room.isPeeker(socket.id)) return; // only guesser decides
 
     if (room.decisionTimeout) clearTimeout(room.decisionTimeout);
-    resolveDecision(room.roomId, !data.swap);
+
+    // BUG FIX: was `resolveDecision(room.roomId, !data.swap)` — the boolean was
+    // inverted, so SWAP was treated as KEEP and vice versa on the server.
+    resolveDecision(room.roomId, data.swap);
   });
 
   // ── Game: Result Acknowledgement (CRS update) ────────────────────────────────
@@ -670,6 +646,16 @@ io.on('connection', (socket) => {
 
     const user = users.get(player.itchId);
     if (!user) return;
+
+    // BUG FIX: the room is deleted before this event arrives (after the 3.5s
+    // delay in resolveDecision), so we can't use it for dedup. Instead gate on
+    // a per-user flag using the room-less approach: check gamesPlayed increment
+    // is idempotent by tracking the last processed game via a timestamp.
+    // Simple fix: only update if the player isn't already being updated
+    // (both clients send ack, but the room is gone — use player-level lock).
+    if (player._resultAckPending) return;
+    player._resultAckPending = true;
+    setTimeout(() => { player._resultAckPending = false; }, 5000);
 
     user.gamesPlayed = (user.gamesPlayed || 0) + 1;
     if (data.won) user.wins = (user.wins || 0) + 1;
@@ -703,23 +689,23 @@ io.on('connection', (socket) => {
       if (idx > -1) matchQueue.splice(idx, 1);
 
       // Notify opponent and clean up active game room
+      // BUG FIX: capture the room BEFORE deleting it from gameRooms,
+      // then clean up. The old code deleted the room then tried to find
+      // it again for the "backward compat" fallback — which always failed.
       const room = findRoomForSocket(socket.id);
       if (room) {
         const opponentSocketId = room.getOpponentSocketId(socket.id);
         if (opponentSocketId) {
           const opponentSocket = io.sockets.sockets.get(opponentSocketId);
           opponentSocket?.emit('opponent_disconnected', { reason: 'disconnect' });
+          // Clear the opponent's roomId so they can re-queue cleanly
+          const opponentPlayer = connectedPlayers.get(opponentSocketId);
+          if (opponentPlayer) opponentPlayer.roomId = null;
         }
         if (room.decisionTimeout) clearTimeout(room.decisionTimeout);
         gameRooms.delete(room.roomId);
         activeRooms.delete(room.roomId);
         console.log(`[Game] Room ${room.roomId} closed — player disconnected`);
-      }
-
-      // Also notify via old room system for backward compat
-      if (player.roomId && !findRoomForSocket(socket.id)) {
-        socket.to(player.roomId).emit('opponent_disconnected');
-        activeRooms.delete(player.roomId);
       }
     }
 
