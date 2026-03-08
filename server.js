@@ -4,13 +4,19 @@
  * State + codeVerifier are stored in a server-side Map to avoid session issues
  */
 
-const express = require('express');
-const cors = require('cors');
-
-const crypto = require('crypto');
+const express    = require('express');
+const cors       = require('cors');
+const crypto     = require('crypto');
+const { Server } = require('socket.io');
+const http       = require('http');
 require('dotenv').config();
 
-const app = express();
+const app    = express();
+const server = http.createServer(app);
+const io     = new Server(server, {
+  cors: { origin: '*', methods: ['GET', 'POST'] }
+});
+
 app.use(express.json());
 app.use(cors({ origin: '*', credentials: true }));
 
@@ -319,11 +325,51 @@ app.get('/player/crs', requireAuth, (req, res) => {
   });
 });
 
-// ─── Online Count ─────────────────────────────────────────────────────────────
-const onlinePlayers = new Set();
+// ─── Online Count (REST fallback) ────────────────────────────────────────────
 app.get('/lobby/online', (req, res) => {
-  res.json({ onlineCount: onlinePlayers.size });
+  res.json({ onlineCount: connectedPlayers.size });
 });
+
+// ─── Invite Links ─────────────────────────────────────────────────────────────
+const inviteCodes = new Map(); // code → { itchId, roomId, createdAt }
+
+app.post('/invite/create', requireAuth, (req, res) => {
+  const code    = crypto.randomBytes(6).toString('hex'); // e.g. "a3f9c2"
+  const roomId  = `room_${crypto.randomBytes(8).toString('hex')}`;
+  inviteCodes.set(code, {
+    itchId:    req.itchId,
+    roomId,
+    createdAt: Date.now()
+  });
+  // Invite link goes to itch.io game page with code in hash
+  const inviteUrl = `https://notsure2505.itch.io/carrot-in-a-box#invite=${code}`;
+  res.json({ code, roomId, inviteUrl });
+});
+
+app.get('/invite/:code', (req, res) => {
+  const invite = inviteCodes.get(req.params.code);
+  if (!invite) return res.status(404).json({ error: 'Invite not found or expired' });
+  const age = Date.now() - invite.createdAt;
+  if (age > 10 * 60 * 1000) { // 10 min expiry
+    inviteCodes.delete(req.params.code);
+    return res.status(410).json({ error: 'Invite expired' });
+  }
+  const host = users.get(invite.itchId);
+  res.json({
+    valid:       true,
+    roomId:      invite.roomId,
+    hostName:    host?.displayName || 'Unknown',
+    code:        req.params.code
+  });
+});
+
+// Clean up expired invites every 10 minutes
+setInterval(() => {
+  const tenMinutesAgo = Date.now() - 10 * 60 * 1000;
+  for (const [code, invite] of inviteCodes) {
+    if (invite.createdAt < tenMinutesAgo) inviteCodes.delete(code);
+  }
+}, 10 * 60 * 1000);
 
 // ─── Record Game Result ───────────────────────────────────────────────────────
 app.post('/game/result', requireAuth, (req, res) => {
@@ -359,5 +405,185 @@ function requireAuth(req, res, next) {
   next();
 }
 
+// ─── Socket.io — Real-time Matchmaking ───────────────────────────────────────
+const connectedPlayers = new Map(); // socketId → { itchId, displayName, inQueue, roomId }
+const matchQueue       = [];        // array of socketIds waiting for a match
+const activeRooms      = new Map(); // roomId → { players: [socketId, socketId], state }
+
+io.on('connection', (socket) => {
+  console.log(`[Socket] Client connected: ${socket.id}`);
+  connectedPlayers.set(socket.id, { itchId: null, displayName: null, inQueue: false, roomId: null });
+
+  // Broadcast updated online count to everyone
+  io.emit('online_count', connectedPlayers.size);
+
+  // ── Authenticate socket ──────────────────────────────────────────────────
+  socket.on('authenticate', (token) => {
+    const itchId = sessionTokens.get(token);
+    if (!itchId) { socket.emit('auth_error', 'Invalid token'); return; }
+    const user = users.get(itchId);
+    if (!user)  { socket.emit('auth_error', 'User not found'); return; }
+
+    const player = connectedPlayers.get(socket.id);
+    player.itchId      = itchId;
+    player.displayName = user.displayName;
+    socket.emit('authenticated', { displayName: user.displayName });
+    console.log(`[Socket] Authenticated: ${user.displayName}`);
+  });
+
+  // ── Join matchmaking queue ───────────────────────────────────────────────
+  socket.on('join_queue', () => {
+    const player = connectedPlayers.get(socket.id);
+    if (!player?.itchId) { socket.emit('error', 'Not authenticated'); return; }
+    if (player.inQueue)  { return; } // already in queue
+
+    player.inQueue = true;
+    matchQueue.push(socket.id);
+    socket.emit('queue_joined', { position: matchQueue.length });
+    io.emit('online_count', connectedPlayers.size);
+
+    console.log(`[Queue] ${player.displayName} joined. Queue size: ${matchQueue.length}`);
+
+    // Try to make a match
+    tryMakeMatch();
+  });
+
+  // ── Leave matchmaking queue ──────────────────────────────────────────────
+  socket.on('leave_queue', () => {
+    const idx = matchQueue.indexOf(socket.id);
+    if (idx > -1) matchQueue.splice(idx, 1);
+    const player = connectedPlayers.get(socket.id);
+    if (player) player.inQueue = false;
+    socket.emit('queue_left');
+  });
+
+  // ── Join via invite code ─────────────────────────────────────────────────
+  socket.on('join_invite', (code) => {
+    const player = connectedPlayers.get(socket.id);
+    if (!player?.itchId) { socket.emit('error', 'Not authenticated'); return; }
+
+    const invite = inviteCodes.get(code);
+    if (!invite)  { socket.emit('invite_error', 'Invite not found or expired'); return; }
+
+    const age = Date.now() - invite.createdAt;
+    if (age > 10 * 60 * 1000) {
+      inviteCodes.delete(code);
+      socket.emit('invite_error', 'Invite has expired');
+      return;
+    }
+
+    // Find the host socket
+    let hostSocketId = null;
+    for (const [sid, p] of connectedPlayers) {
+      if (p.itchId === invite.itchId) { hostSocketId = sid; break; }
+    }
+
+    if (!hostSocketId) { socket.emit('invite_error', 'Host is no longer online'); return; }
+
+    inviteCodes.delete(code); // one-use invite
+    createMatch(hostSocketId, socket.id, invite.roomId);
+  });
+
+  // ── Host waits in invite room ───────────────────────────────────────────────
+  socket.on('host_invite_room', (code) => {
+    const invite = inviteCodes.get(code);
+    if (!invite) { socket.emit('invite_error', 'Invite not found'); return; }
+    socket.join(invite.roomId); // host joins room and waits
+    console.log(`[Socket] Host waiting in room ${invite.roomId}`);
+  });
+
+  // ── In-game events (relay between players) ──────────────────────────────
+  socket.on('game_action', (data) => {
+    const player = connectedPlayers.get(socket.id);
+    if (!player?.roomId) return;
+    // Relay to the other player in the room
+    socket.to(player.roomId).emit('opponent_action', data);
+  });
+
+  // ── Disconnect ───────────────────────────────────────────────────────────
+  socket.on('disconnect', () => {
+    const player = connectedPlayers.get(socket.id);
+    if (player) {
+      // Remove from queue
+      const idx = matchQueue.indexOf(socket.id);
+      if (idx > -1) matchQueue.splice(idx, 1);
+
+      // Notify opponent if in a room
+      if (player.roomId) {
+        socket.to(player.roomId).emit('opponent_disconnected');
+        activeRooms.delete(player.roomId);
+      }
+    }
+    connectedPlayers.delete(socket.id);
+    io.emit('online_count', connectedPlayers.size);
+    console.log(`[Socket] Disconnected: ${socket.id}`);
+  });
+});
+
+// ── Match creation helpers ────────────────────────────────────────────────────
+function tryMakeMatch() {
+  if (matchQueue.length < 2) return;
+
+  const socketIdA = matchQueue.shift();
+  const socketIdB = matchQueue.shift();
+
+  const playerA = connectedPlayers.get(socketIdA);
+  const playerB = connectedPlayers.get(socketIdB);
+
+  if (!playerA || !playerB) {
+    // One disconnected — put the other back
+    if (playerA) matchQueue.unshift(socketIdA);
+    if (playerB) matchQueue.unshift(socketIdB);
+    return;
+  }
+
+  const roomId = `room_${crypto.randomBytes(8).toString('hex')}`;
+  createMatch(socketIdA, socketIdB, roomId);
+}
+
+function createMatch(socketIdA, socketIdB, roomId) {
+  const playerA = connectedPlayers.get(socketIdA);
+  const playerB = connectedPlayers.get(socketIdB);
+
+  if (!playerA || !playerB) return;
+
+  playerA.inQueue = false;
+  playerB.inQueue = false;
+  playerA.roomId  = roomId;
+  playerB.roomId  = roomId;
+
+  // Randomly decide who sees inside the box (the "peeker")
+  const peekerIsA = Math.random() < 0.5;
+
+  activeRooms.set(roomId, {
+    players: [socketIdA, socketIdB],
+    state:   'waiting'
+  });
+
+  // Join both to the Socket.io room
+  const socketA = io.sockets.sockets.get(socketIdA);
+  const socketB = io.sockets.sockets.get(socketIdB);
+  socketA?.join(roomId);
+  socketB?.join(roomId);
+
+  // Notify both players — tell each their role
+  socketA?.emit('match_found', {
+    roomId,
+    opponentName: playerB.displayName,
+    role:         peekerIsA ? 'peeker' : 'guesser',  // peeker sees inside box
+    message:      `Match found! Playing against ${playerB.displayName}`
+  });
+
+  socketB?.emit('match_found', {
+    roomId,
+    opponentName: playerA.displayName,
+    role:         peekerIsA ? 'guesser' : 'peeker',
+    message:      `Match found! Playing against ${playerA.displayName}`
+  });
+
+  console.log(`[Match] Created room ${roomId}: ${playerA.displayName} vs ${playerB.displayName}`);
+}
+
+// ── Start server ──────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🥕 Carrot OAuth server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`🥕 Carrot server running on port ${PORT}`));
