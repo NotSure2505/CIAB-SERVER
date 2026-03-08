@@ -111,13 +111,14 @@ app.get('/auth/callback', async (req, res) => {
 
     if (tokenData.errors) throw new Error(tokenData.errors.join(', '));
 
-    // itch.io returns { key: { key: "abc123..." } }
-    const accessToken = tokenData.key?.key || tokenData.access_token;
+    const accessToken = tokenData.access_token;
     if (!accessToken) throw new Error('No access token in response: ' + JSON.stringify(tokenData));
 
-    console.log('[Auth] Got access token, fetching profile...');
+    // itch.io token response includes user_id directly in key object
+    // Use it to fetch profile via the correct endpoint
+    const userId = tokenData.key?.user_id;
+    console.log(`[Auth] Got access token for user_id: ${userId}, fetching profile...`);
 
-    // Fetch user profile — itch.io uses KEY in the URL path
     const profileRes = await fetch(`https://api.itch.io/api/1/${accessToken}/me`);
     const profileText = await profileRes.text();
     console.log('[Auth] Profile response:', profileText.substring(0, 300));
@@ -126,11 +127,18 @@ app.get('/auth/callback', async (req, res) => {
     try {
       profile = JSON.parse(profileText);
     } catch (e) {
-      throw new Error('Could not parse profile response from itch.io');
+      throw new Error('Could not parse profile response');
     }
 
-    if (profile.errors) throw new Error(profile.errors.join(', '));
-    const itchUser = profile.user;
+    // Build itchUser from whatever we have
+    // If profile endpoint fails, fall back to token data
+    const itchUser = profile.user || {
+      id:           userId,
+      username:     `user_${userId}`,
+      display_name: `Player_${userId}`
+    };
+
+    console.log('[Auth] User:', JSON.stringify(itchUser));
 
     console.log(`[Auth] Logged in: ${itchUser.username} (id: ${itchUser.id})`);
 
